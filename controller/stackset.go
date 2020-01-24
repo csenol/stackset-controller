@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -51,7 +50,6 @@ type StackSetController struct {
 	logger                      *log.Entry
 	client                      clientset.Interface
 	controllerID                string
-	migrateTo                   string
 	backendWeightsAnnotationKey string
 	clusterDomain               string
 	interval                    time.Duration
@@ -77,7 +75,7 @@ func (ee *eventedError) Error() string {
 }
 
 // NewStackSetController initializes a new StackSetController.
-func NewStackSetController(client clientset.Interface, controllerID, migrateTo, backendWeightsAnnotationKey, clusterDomain string, registry prometheus.Registerer, interval time.Duration) (*StackSetController, error) {
+func NewStackSetController(client clientset.Interface, controllerID, backendWeightsAnnotationKey, clusterDomain string, registry prometheus.Registerer, interval time.Duration) (*StackSetController, error) {
 	metricsReporter, err := core.NewMetricsReporter(registry)
 	if err != nil {
 		return nil, err
@@ -87,7 +85,6 @@ func NewStackSetController(client clientset.Interface, controllerID, migrateTo, 
 		logger:                      log.WithFields(log.Fields{"controller": "stackset"}),
 		client:                      client,
 		controllerID:                controllerID,
-		migrateTo:                   migrateTo,
 		backendWeightsAnnotationKey: backendWeightsAnnotationKey,
 		clusterDomain:               clusterDomain,
 		interval:                    interval,
@@ -113,163 +110,10 @@ func (c *StackSetController) stackLogger(ssc *core.StackSetContainer, sc *core.S
 	})
 }
 
-func (c *StackSetController) startMigrate(ctx context.Context) error {
-	zv1Stacksets, err := c.client.ZalandoV1().StackSets(v1.NamespaceAll).List(metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-
-	stacksets := make(map[types.UID]*core.StackSetContainer, len(zv1Stacksets.Items))
-	for _, stackset := range zv1Stacksets.Items {
-		stackset := stackset
-		fixupStackSetTypeMeta(&stackset)
-		if !c.hasOwnership(&stackset) {
-			continue
-		}
-		stacksetContainer := &core.StackSetContainer{
-			StackSet:        &stackset,
-			StackContainers: map[types.UID]*core.StackContainer{},
-		}
-		stacksets[stackset.UID] = stacksetContainer
-	}
-
-	ingresses, err := c.client.ExtensionsV1beta1().Ingresses(v1.NamespaceAll).List(metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-
-Items:
-	for _, i := range ingresses.Items {
-		ingress := i
-		if uid, ok := getOwnerUID(ingress.ObjectMeta); ok {
-			// stackset ingress
-			if s, ok := stacksets[uid]; ok {
-				s.Ingress = &ingress
-				continue Items
-			}
-
-			// stack ingress
-			for _, stackset := range stacksets {
-				if s, ok := stackset.StackContainers[uid]; ok {
-					s.Resources.Ingress = &ingress
-					continue Items
-				}
-			}
-		}
-	}
-
-	c.logger.Infof("Migrate to %s", c.migrateTo)
-	return c.Migrate(ctx, stacksets)
-}
-
-func (c *StackSetController) Migrate(ctx context.Context, stacksetContainers map[types.UID]*core.StackSetContainer) error {
-
-	c.logger.Infof("Start to migrate %d stacksets to %s", len(stacksetContainers), c.migrateTo)
-	for _, container := range stacksetContainers {
-		var err error
-		switch c.migrateTo {
-		case "ingress":
-			err = c.migrateToIngress(ctx, container)
-		case "stackset":
-			err = c.migrateToStackset(ctx, container)
-		}
-
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (c *StackSetController) migrateToStackset(ctx context.Context, ssc *core.StackSetContainer) error {
-	if ssc.Ingress == nil {
-		return nil
-	}
-
-	if v, ok := ssc.Ingress.Annotations[stackTrafficWeightsAnnotationKey]; ok {
-		weight := make(map[string]float64)
-		err := json.Unmarshal([]byte(v), &weight)
-		if err != nil {
-			return err
-		}
-		c.logger.Infof("Have %d ingress weights for %s/%s to migrate", len(weight), ssc.StackSet.Namespace, ssc.StackSet.Name)
-		if len(weight) == 0 {
-			return nil
-		}
-
-		// create spec traffic
-		dts := make([]*zv1.DesiredTraffic, 0, len(weight))
-		for k, v := range weight {
-			dt := &zv1.DesiredTraffic{
-				StackName: k,
-				Weight:    v,
-			}
-			dts = append(dts, dt)
-		}
-		ssc.StackSet.Spec.Traffic = dts
-
-		// remove ingress annotation
-		delete(ssc.Ingress.Annotations, stackTrafficWeightsAnnotationKey)
-		// set stackset to be authorative
-		ssc.Ingress.Annotations[ingressAuthorativeAnnotationKey] = "false"
-
-		// sync back to Kubernetes
-		ns := ssc.StackSet.Namespace
-		if _, err := c.client.ZalandoV1().StackSets(ns).Update(ssc.StackSet); err != nil {
-			return err
-		}
-		if _, err := c.client.ExtensionsV1beta1().Ingresses(ns).Update(ssc.Ingress); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (c *StackSetController) migrateToIngress(ctx context.Context, ssc *core.StackSetContainer) error {
-	c.logger.Infof("Have %d stackset weights for %s/%s to migrate", len(ssc.StackSet.Spec.Traffic), ssc.StackSet.Namespace, ssc.StackSet.Name)
-	if len(ssc.StackSet.Spec.Traffic) > 0 {
-		weight := make(map[string]float64)
-		for _, dt := range ssc.StackSet.Spec.Traffic {
-			weight[dt.StackName] = dt.Weight
-		}
-
-		buf, err := json.Marshal(weight)
-		if err != nil {
-			return err
-		}
-
-		// add ingress annotation
-		ssc.Ingress.Annotations[stackTrafficWeightsAnnotationKey] = string(buf)
-		// set ingress to be authorative
-		ssc.Ingress.Annotations[ingressAuthorativeAnnotationKey] = "true"
-		// remove traffic spec
-		ssc.StackSet.Spec.Traffic = nil
-
-		// sync back to Kubernetes
-		ns := ssc.StackSet.Namespace
-		if _, err := c.client.ZalandoV1().StackSets(ns).Update(ssc.StackSet); err != nil {
-			return err
-		}
-		if _, err := c.client.ExtensionsV1beta1().Ingresses(ns).Update(ssc.Ingress); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Run runs the main loop of the StackSetController. Before the loops it
 // sets up a watcher to watch StackSet resources. The watch will send
 // changes over a channel which is polled from the main loop.
 func (c *StackSetController) Run(ctx context.Context) {
-	migrate := c.migrateTo != ""
-	if migrate {
-		if err := c.startMigrate(ctx); err != nil {
-			c.logger.Fatalf("Failed to migrate: %v", err)
-		}
-	}
-
 	c.startWatch(ctx)
 
 	nextCheck := time.Now().Add(-c.interval)
@@ -360,7 +204,7 @@ func (c *StackSetController) collectResources() (map[types.UID]*core.StackSetCon
 			}
 		}
 
-		stacksetContainer := core.NewContainer(&stackset, reconciler, c.migrateTo == "stackset", c.backendWeightsAnnotationKey, c.clusterDomain)
+		stacksetContainer := core.NewContainer(&stackset, reconciler, c.backendWeightsAnnotationKey, c.clusterDomain)
 		stacksets[uid] = stacksetContainer
 	}
 
